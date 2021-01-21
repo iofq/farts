@@ -1,0 +1,101 @@
+#!/bin/bash
+RESET='\033[0m' 
+BLACK='\033[0;30m'
+RED='\033[0;31m' 
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m' 
+PURPLE='\033[0;35m' 
+CYAN='\033[0;36m'  
+WHITE='\033[0;37m'
+
+install_helpers() {
+    sudo pacman -S --noconfirm --needed base-devel
+    mkdir -p makepkg && cd makepkg
+    for package in ${helpers[*]}; do 
+        (
+        git clone https://aur.archlinux.org/$package.git
+        cd $package
+        makepkg --noconfirm -fsric
+        )
+    done
+}
+
+install_dependancies() {
+    sudo pacman --noconfirm --needed -Syu $(comm -12 <(pacman -Slq | sort) <(echo ${dependancies[*]} | tr ' ' '\n' | sort))
+    AUR_DEPS=$(comm -13 <(comm -12 <(pacman -Qq | sort) <(echo ${dependancies[*]} | sort)) <(echo ${dependancies[*]} | sort))
+    paru --noconfirm -Syu $AUR_DEPS
+}
+
+zip() {
+    mkdir -p zip
+    for file in ${system[*]}; do
+        sudo su -c "cp --parents -a $file zip"
+    done
+    (
+    echo -e "#!/bin/bash\nsystem=(" > zip/farts.cfg
+    echo -e ${system[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
+    echo -e ")\nhelpers=(" >> zip/farts.cfg
+    echo -e ${helpers[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
+    echo -e ")\ndependancies=(" >> zip/farts.cfg
+    echo -e ${dependancies[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
+    echo -e ")" >> zip/farts.cfg
+    declare -f pre_custom post_custom>> zip/farts.cfg
+    )
+    sudo su -c "XZ_OPT=-9 tar --remove-files -cJf farts.tar.xz zip"
+}
+
+rip() {
+    EXPAND_TO="/"
+    IGNORE=$(echo " farts.cfg" | sed "s/ / ! -wholename .\//g")
+    (
+    cd zip
+    for f in $(find . -type f $IGNORE); do
+        echo "->" $EXPAND_TO"${f#./}"
+        [[ $(dirname $f) != "." ]] && \
+            sudo mkdir -p $EXPAND_TO$(dirname ${f#./})
+        sudo rm -f $EXPAND_TO"${f#./}"
+        sudo cp -a $(realpath $f) $EXPAND_TO"${f#./}"
+    done
+    )
+    pre_custom
+    install_helpers
+    install_dependancies
+    post_custom
+}
+
+clean() {
+    sudo rm -rf zip/ makepkg/
+}
+
+usage() {
+    echo -e "${GREEN}usage$RESET:"
+    echo -e "    ${CYAN}farts zip ${GREEN}<config>$RESET: create a tar.xz of important files and installed packages as defined in config file. if no config file specified, farts.cfg in the current directory will be tried."
+    echo -e "    ${CYAN}farts rip ${GREEN}<farts.tar.xz>$RESET: expand tar.xz to root directory, install dependancies via pacman, run custom user install functions"
+}
+
+main() {
+    case $1 in 
+        zip)
+            shift
+            if [[ -f $1 ]]; then
+                source $1 
+            elif [[ $1 == "" ]]; then
+                source farts.cfg
+            else
+                echo "Config file not found" 
+                exit 1
+            fi
+            zip;;
+        rip)
+            shift
+            tar -xJf $1
+            source zip/farts.cfg
+            rip
+            clean;;
+        *)
+            usage;;
+    esac
+}
+
+main $@
