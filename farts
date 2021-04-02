@@ -9,10 +9,15 @@ PURPLE='\033[0;35m'
 CYAN='\033[0;36m'  
 WHITE='\033[0;37m'
 
+#defaults
+[[ -z $EXPAND_TO ]] && EXPAND_TO="/"
+[[ -z $OUTPUT_FILE ]] && OUTPUT_FILE="farts.tar.xz"
+
 install_helpers() {
-    sudo pacman -S --noconfirm --needed base-devel
+    sudo pacman -S --noconfirm fakeroot binutils elfutils gcc pkgconf make
     mkdir -p makepkg && cd makepkg
     for package in ${helpers[*]}; do 
+        [[ $package = "makepkg" ]] && continue
         (
         git clone https://aur.archlinux.org/$package.git
         cd $package
@@ -21,47 +26,100 @@ install_helpers() {
     done
 }
 
+#returns first installed aur helper
+get_installed_helper() {
+    for package in ${helpers[0]}; do 
+        h=$(comm -12 <(pacman -Qq | sort) <(echo $package))
+        echo ${h%"-bin"}
+    done
+}
+
 install_dependancies() {
-    sudo pacman --noconfirm --needed -Syu $(comm -12 <(pacman -Slq | sort) <(echo ${dependancies[*]} | tr ' ' '\n' | sort))
-    AUR_DEPS=$(comm -13 <(comm -12 <(pacman -Qq | sort) <(echo ${dependancies[*]} | sort)) <(echo ${dependancies[*]} | sort))
-    paru --noconfirm -Syu $AUR_DEPS
+    AUR_HELPER=$(get_installed_helper)
+    REPO_DEPS=$(comm -12 <(pacman -Slq | sort) <(echo ${dependancies[*]} | tr ' ' '\n' | sort))
+    REPO_VALIDATED=""
+    for r in $REPO_DEPS; do
+        if pacman -Ss $r; then
+            REPO_VALIDATED=$REPO_VALIDATED" $r"
+        else
+            echo -e ${RED}\'$r\' "not found in arch repositories, skipping.${RESET}"
+        fi
+    done
+    sudo pacman --noconfirm --needed -Syu $REPO_VALIDATED
+
+    if [[ ! -z $AUR_HELPER ]]; then
+        AUR_DEPS=$(comm -13 <(pacman -Qq | tr ' ' '\n' | sort) <(echo ${dependancies[*]} | tr ' ' '\n' | sort))
+        AUR_VALIDATED=""
+        for r in $AUR_DEPS; do
+            if $AUR_HELPER -Ss $r; then
+                AUR_VALIDATED=$AUR_VALIDATED" $r"
+            else
+                echo -e ${RED}\'$r\' "not found in AUR, skipping.${RESET}"
+            fi
+        done
+        $AUR_HELPER --noconfirm -Syu $AUR_VALIDATED
+    fi
 }
 
 zip() {
     mkdir -p zip
-    for file in ${system[*]}; do
-        sudo su -c "cp --parents -a $file zip"
+    for f in ${system[*]}; do
+        file=${f//\~/'$HOME'} #expand ~/ before sudo
+        expanded=$(echo $file | envsubst | sed 's/\/\//\//g') #expand envs
+        if [[ -d $expanded ]]; then
+            mkdir -p zip/$file
+            sudo -E /bin/sh -c "find $expanded -type f -print0" | \
+                while IFS= read -r -d '' line; do
+                    target=$(echo zip/${file}${line#$expanded} | sed 's/\/\//\//g')
+                    echo -e ${line}${CYAN} "->" ${RESET}${target}
+                    sudo -E /bin/cp -a ${expanded} ${target} || (ERR=1)
+                done
+        else
+            echo -e ${expanded}${CYAN} "->" zip/${RESET}${file}
+            base_filename=$(basename ${file})
+            path_filename=$(realpath ${file})
+            mkdir -p zip${path_filename#$base_filename}
+            sudo -E /bin/cp -a ${expanded} zip${file} || (ERR=1)
+        fi
     done
     (
-    echo -e "#!/bin/bash\nsystem=(" > zip/farts.cfg
-    echo -e ${system[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
-    echo -e ")\nhelpers=(" >> zip/farts.cfg
-    echo -e ${helpers[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
-    echo -e ")\ndependancies=(" >> zip/farts.cfg
-    echo -e ${dependancies[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
-    echo -e ")" >> zip/farts.cfg
-    declare -f pre_custom post_custom>> zip/farts.cfg
+    if [[ ! -z $system ]]; then
+        echo -e "#!/bin/bash\nsystem=(" > zip/farts.cfg
+        echo -e ${system[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
+        echo -e ")" >> zip/farts.cfg
+    fi
+    if [[ ! -z $helpers ]]; then
+        echo -e "\nhelpers=(" >> zip/farts.cfg
+        echo -e ${helpers[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
+        echo -e ")" >> zip/farts.cfg
+    fi
+    if [[ ! -z $dependancies ]]; then
+        echo -e "\ndependancies=(" >> zip/farts.cfg
+        echo -e ${dependancies[*]} | tr ' ' '\n' | sed -e 's/^\|$/"/g' >> zip/farts.cfg
+        echo -e ")" >> zip/farts.cfg
+    fi
+    declare -f pre_custom post_custom >> zip/farts.cfg 
     )
-    sudo su -c "XZ_OPT=-9 tar --remove-files -cJf farts.tar.xz zip"
+    [[ ! -z $ERR ]] && \
+        echo -e "${RED}One or more files could not be copied, make sure you have what you need!$RESET"
+    sudo su -c "XZ_OPT=-9 tar --remove-files -cJf ${OUTPUT_FILE} zip"
 }
 
-rip() {
-    EXPAND_TO="/"
+unzip() {
     IGNORE=$(echo " farts.cfg" | sed "s/ / ! -wholename .\//g")
     (
     cd zip
-    for f in $(find . -type f $IGNORE); do
-        echo "->" $EXPAND_TO"${f#./}"
-        [[ $(dirname $f) != "." ]] && \
-            sudo mkdir -p $EXPAND_TO$(dirname ${f#./})
-        sudo rm -f $EXPAND_TO"${f#./}"
-        sudo cp -a $(realpath $f) $EXPAND_TO"${f#./}"
-    done
+    find . -type f $IGNORE -exec expand_file {} \;
     )
-    pre_custom
-    install_helpers
-    install_dependancies
-    post_custom
+}
+
+expand_file() {
+    echo $@
+    # file=$(echo $@ | envsubst | sed 's/\/\//\//g');
+    # echo -e ${$@#./}${CYAN} "->" ${RESET}$EXPAND_TO"${file#./}";
+    # [[ $(dirname $file) != "." ]] && \
+    #     sudo mkdir -p $EXPAND_TO$(dirname ${file#./});
+    # sudo \cp -rfa ${f#./} $EXPAND_TO"${file#./}";
 }
 
 clean() {
@@ -71,31 +129,57 @@ clean() {
 usage() {
     echo -e "${GREEN}usage$RESET:"
     echo -e "    ${CYAN}farts zip ${GREEN}<config>$RESET: create a tar.xz of important files and installed packages as defined in config file. if no config file specified, farts.cfg in the current directory will be tried."
-    echo -e "    ${CYAN}farts rip ${GREEN}<farts.tar.xz>$RESET: expand tar.xz to root directory, install dependancies via pacman, run custom user install functions"
+    echo -e "    ${CYAN}farts unzip ${GREEN}<farts.tar.xz>$RESET: expand tar.xz to root directory, install dependancies via pacman, run custom user install functions"
 }
 
 main() {
+    sudo -v
     case $1 in 
-        zip)
-            shift
-            if [[ -f $1 ]]; then
-                source $1 
-            elif [[ $1 == "" ]]; then
-                source farts.cfg
-            else
-                echo "Config file not found" 
-                exit 1
-            fi
-            zip;;
-        rip)
-            shift
-            tar -xJf $1
-            source zip/farts.cfg
-            rip
-            clean;;
-        *)
-            usage;;
+    zip)
+        shift
+        if [[ ! -z $CONFIG_FILE ]]; then
+            source $CONFIG_FILE
+        elif [[ -f farts.cfg ]]; then
+            source farts.cfg && CONFIG_FILE="farts.cfg"
+        else
+            echo "${RED}Config file not found!$RESET" && false
+        fi
+        [[ $? == "1" ]] && exit 1
+        echo -e "${CYAN}Creating system archive using config file: ${RESET}"${CONFIG_FILE}
+        zip || (clean; exit 0);;
+   unzip)
+        shift
+        tar -xJf $1
+        source zip/farts.cfg || exit 1
+        unzip
+        clean;;
+    install)
+        shift
+        tar -xJf $1
+        source zip/farts.cfg || exit 1
+        unzip
+        install_helpers
+        pre_custom
+        install_dependancies
+        post_custom
+        clean;;
+    *)
+        usage;;
     esac
 }
 
+while getopts x:o: option
+do
+  case "${option}"
+    in
+    x) EXPAND_TO=$1;shift;;
+    c) CONFIG_FILE=$1;shift;;
+    h) usage;;
+  esac
+done
+
+if [[ ! -z $SUDO_USER ]]; then
+    echo -e "${RED}Run without sudo!${RESET}"
+    exit 1
+fi
 main $@
